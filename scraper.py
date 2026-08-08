@@ -1,20 +1,22 @@
 """
-Monitor naborów PSP (woj. śląskie) - niezależny od Google.
+Monitor naborow PSP (woj. slaskie) - niezalezny od Google.
 
 Co robi:
-1. Pobiera stronę KW PSP Katowice z listą naborów
-2. Wykrywa nowe ogłoszenia (porównując z data.csv)
-3. Dopisuje nowe wiersze do data.csv (miasto, data, stanowisko, link - reszta do ręcznego uzupełnienia)
-4. Wysyła powiadomienie na Telegram o nowych naborach
-5. Generuje dashboard.html (tabele + wykresy, Chart.js) na podstawie wszystkich danych
-
-Uruchamiane cyklicznie przez GitHub Actions (patrz .github/workflows/check-nabory.yml)
+1. Pobiera strone KW PSP Katowice z lista naborow
+2. Wykrywa nowe ogloszenia (porownujac z data.csv) i dopisuje je
+3. Douzupelnia brakujace pola (miasto/data/stanowisko) w JUZ zapisanych
+   wierszach, jesli link nadal jest widoczny na stronie - nigdy nie
+   nadpisuje pol, ktore juz maja jakas wartosc (np. recznie wpisana
+   zdawalnosc czy wynagrodzenie)
+4. Wysyla powiadomienie na Telegram o nowych naborach (opcjonalne)
+5. Generuje dashboard.html (tabele + wykresy Chart.js)
 """
 
 import csv
-import json
+import html as html_lib
 import os
 import re
+import json
 from datetime import datetime
 
 import requests
@@ -31,16 +33,32 @@ FIELDNAMES = [
     "uwagi", "udzial",
 ]
 
+# Nagłówek "Ogłoszenie(a) zamieszczone DD.MM.RRRR roku:" - zawsze format cyfrowy
+DATE_RE = re.compile(r"zamieszczon\w*\s+(\d{1,2}[.\s]\d{1,2}[.\s]\d{4})", re.I)
+
+# Miasto: albo skrót "PSP w X", albo pełna forma "Straży Pożarnej w X"
 CITY_RE = re.compile(
-    r"PSP\s+w\s+([A-ZŚŻŹĆŁÓĄĘŃ][\wąćęłńóśźż\-]+(?:\s+[A-ZŚŻŹĆŁÓĄĘŃ][\wąćęłńóśźż\-]+){0,2})"
-)
-DATE_RE = re.compile(
-    r"zamieszczon\w*\s+(\d{1,2}[.\s]\d{1,2}[.\s]\d{4}|\d{1,2}\s+\w+\s+\d{4})", re.I
-)
-POSITION_RE = re.compile(
-    r"docelowo\s*[:\-–]?\s*([a-ząćęłńóśźż\s\-]+?)(?:\)|,|\s+w\s+(?:Jednostce|Komendzie|Sekcji|podległych))",
+    r"(?:PSP|Straży\s+Pożarnej)\s+w\s+"
+    r"([A-ZŚŻŹĆŁÓĄĘŃ][\wąćęłńóśźż\-]+(?:\s+[A-ZŚŻŹĆŁÓĄĘŃ][\wąćęłńóśźż\-]+){0,2})",
     re.I,
 )
+
+# Stanowisko: to co jest w nawiasie po słowie "stażyst(a/y)"
+POSITION_RE = re.compile(r"sta[żz]yst\w*\s*\(([^)]+)\)", re.I)
+
+# Liczba stanowisk (best-effort)
+WORD_NUM = {"dwa": 2, "trzy": 3, "cztery": 4, "pięć": 5}
+COUNT_RE = re.compile(
+    r"liczba stanowisk[:\-–]?\s*(\d+)"
+    r"|na\s+(\d+)\s+stanowisk"
+    r"|na\s+(dwa|trzy|cztery|pięć)\s+stanowisk",
+    re.I,
+)
+
+MONTHS_PL = {
+    "stycznia": 1, "lutego": 2, "marca": 3, "kwietnia": 4, "maja": 5, "czerwca": 6,
+    "lipca": 7, "sierpnia": 8, "września": 9, "października": 10, "listopada": 11, "grudnia": 12,
+}
 
 
 def fetch_page():
@@ -49,58 +67,95 @@ def fetch_page():
     return resp.text
 
 
-def extract_content_tags(html):
-    soup = BeautifulSoup(html, "html.parser")
-    heading = soup.find(
-        lambda tag: tag.name in ("h1", "h2") and "Nabory do KP/M PSP" in tag.get_text()
-    )
-    if not heading:
-        return list(soup.find_all("a"))
-    tags = []
-    for sib in heading.find_all_next():
-        text = sib.get_text(strip=True)
-        if text.startswith("Informacje o publikacji dokumentu"):
-            break
-        tags.append(sib)
-    return tags
+def extract_content(html_text):
+    """Zwraca (raw_content_html, plain_text) - sekcja miedzy naglowkiem a stopka historii."""
+    start = html_text.find("Nabory do KP/M PSP woj")
+    section = html_text[start if start > -1 else 0:]
+    end = section.find("Informacje o publikacji dokumentu")
+    content = section[:end] if end > -1 else section
+    plain = html_lib.unescape(re.sub(r"<[^>]+>", " ", content))
+    plain = re.sub(r"\s+", " ", plain)
+    return content, plain
 
 
-def find_nabor_links(content_tags):
-    links, seen = [], set()
-    for tag in content_tags:
-        if tag.name == "a" and tag.get("href"):
-            href = tag["href"].split("#")[0]
-            if re.search(r"gov\.pl/web/(km|kp)psp", href) and href not in seen:
-                seen.add(href)
-                links.append((href, tag))
+def find_links(content):
+    seen, links = set(), []
+    for m in re.finditer(r'<a[^>]+href="(https?://www\.gov\.pl/web/(?:km|kp)psp[^"]+)"', content):
+        href = m.group(1).split("#")[0].rstrip("/")
+        if href not in seen:
+            seen.add(href)
+            links.append((href, m.start()))
     return links
 
 
-def parse_entry(href, anchor_tag):
-    context, node = "", anchor_tag
-    for _ in range(6):
-        node = node.parent
-        if node is None:
-            break
-        context = node.get_text(" ", strip=True)
-        if len(context) > 200:
-            break
+def plain_pos_for(content, raw_idx):
+    """Przyblizona pozycja w plain-texcie odpowiadajaca pozycji raw_idx w content (z tagami)."""
+    prefix = content[:raw_idx]
+    return len(html_lib.unescape(re.sub(r"<[^>]+>", " ", prefix)))
 
-    date_m = DATE_RE.search(context)
-    city_m = CITY_RE.findall(context)
-    pos_m = POSITION_RE.search(context)
 
-    return {
-        "miasto": city_m[-1] if city_m else "",
-        "data_ogloszenia": date_m.group(1) if date_m else "",
-        "liczba_stanowisk": "",
-        "stanowisko_docelowe": pos_m.group(1).strip() if pos_m else "",
-        "wymagania": "",
-        "link": href,
-        "i_etap_chetni": "", "ii_etap_zdalo": "", "zdawalnosc_pct": "",
-        "iv_etap": "", "v_etap": "", "wynagrodzenie_brutto": "",
-        "wynagrodzenie_netto": "", "uwagi": "", "udzial": "",
-    }
+def nearest_before(matches, pos):
+    """Zwraca ostatni match (re.Match) ktorego .start() <= pos, albo None."""
+    best = None
+    for m in matches:
+        if m.start() <= pos:
+            best = m
+        else:
+            break
+    return best
+
+
+def clean_position(raw):
+    if not raw:
+        return ""
+    raw = raw.strip()
+    raw = re.sub(r"^docelowo\s*[:\-–]?\s*", "", raw, flags=re.I)
+    raw = re.sub(r"^stanowisko\s+docelowe\s*[:\-–]?\s*", "", raw, flags=re.I)
+    raw = raw.split(",")[0].strip()
+    return raw
+
+
+def extract_count(snippet):
+    m = COUNT_RE.search(snippet)
+    if not m:
+        return ""
+    if m.group(1):
+        return m.group(1)
+    if m.group(2):
+        return m.group(2)
+    if m.group(3):
+        return str(WORD_NUM.get(m.group(3).lower(), ""))
+    return ""
+
+
+def parse_all(content, plain):
+    """Zwraca dict: link -> {miasto, data_ogloszenia, stanowisko_docelowe, liczba_stanowisk}"""
+    date_matches = list(DATE_RE.finditer(plain))
+    city_matches = list(CITY_RE.finditer(plain))
+    pos_matches = list(POSITION_RE.finditer(plain))
+
+    result = {}
+    for href, raw_idx in find_links(content):
+        p = plain_pos_for(content, raw_idx)
+
+        dm = nearest_before(date_matches, p)
+        cm = nearest_before(city_matches, p)
+        # stanowisko zwykle jest PRZED linkiem w tym samym akapicie
+        pm = nearest_before(pos_matches, p)
+        # jesli najblizszy wczesniejszy jest za daleko (>1200 znakow), to raczej nalezy do innego akapitu
+        if pm and (p - pm.start()) > 1200:
+            pm = None
+
+        # kontekst do wyszukania liczby stanowisk (500 znakow wstecz)
+        snippet = plain[max(0, p - 800):p]
+
+        result[href] = {
+            "miasto": cm.group(1).strip() if cm else "",
+            "data_ogloszenia": dm.group(1).strip() if dm else "",
+            "stanowisko_docelowe": clean_position(pm.group(1)) if pm else "",
+            "liczba_stanowisk": extract_count(snippet),
+        }
+    return result
 
 
 def load_existing():
@@ -139,9 +194,20 @@ def send_telegram(new_rows):
         print("Nie udało się wysłać powiadomienia Telegram:", e)
 
 
+def parse_any_date(d):
+    if not d:
+        return None
+    m = re.match(r"(\d{1,2})[.\s](\d{1,2})[.\s](\d{4})", d)
+    if m:
+        return int(m.group(3)), int(m.group(2))
+    m = re.match(r"(\d{1,2})\s+([a-złąęśćźżó]+)\s+(\d{4})", d, re.I)
+    if m and m.group(2).lower() in MONTHS_PL:
+        return int(m.group(3)), MONTHS_PL[m.group(2).lower()]
+    return None
+
+
 def build_dashboard(rows):
     by_city, by_month = {}, {}
-
     for r in rows:
         city = (r.get("miasto") or "").strip()
         if not city:
@@ -167,10 +233,9 @@ def build_dashboard(rows):
             except ValueError:
                 pass
 
-        d = r.get("data_ogloszenia") or ""
-        dm = re.match(r"(\d{1,2})[.\s](\d{1,2})[.\s](\d{4})", d)
-        if dm:
-            key = f"{dm.group(3)}-{int(dm.group(2)):02d}"
+        ym = parse_any_date(r.get("data_ogloszenia") or "")
+        if ym:
+            key = f"{ym[0]}-{ym[1]:02d}"
             by_month[key] = by_month.get(key, 0) + 1
 
     city_labels = sorted(by_city, key=lambda c: -by_city[c]["count"])
@@ -182,7 +247,7 @@ def build_dashboard(rows):
     month_labels = sorted(by_month)
     month_values = [by_month[m] for m in month_labels]
 
-    html = (
+    out = (
         DASHBOARD_TEMPLATE
         .replace("__DATA__", json.dumps(rows, ensure_ascii=False))
         .replace("__CITY_LABELS__", json.dumps(city_labels, ensure_ascii=False))
@@ -196,10 +261,10 @@ def build_dashboard(rows):
         .replace("__UPDATED__", datetime.now().strftime("%Y-%m-%d %H:%M"))
     )
     with open(DASHBOARD_HTML, "w", encoding="utf-8") as f:
-        f.write(html)
+        f.write(out)
 
 
-DASHBOARD_TEMPLATE = """<!doctype html>
+DASHBOARD_TEMPLATE = r"""<!doctype html>
 <html lang="pl">
 <head>
 <meta charset="utf-8">
@@ -210,9 +275,13 @@ DASHBOARD_TEMPLATE = """<!doctype html>
   body { font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 24px; background: #f6f7f9; color: #1a1a1a; }
   h1 { font-size: 22px; margin-bottom: 4px; }
   .updated { color: #666; font-size: 13px; margin-bottom: 24px; }
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 32px; }
-  .card { background: white; border-radius: 12px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+  .card { background: white; border-radius: 12px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin-bottom: 32px; }
   .card h2 { font-size: 15px; margin: 0 0 12px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 32px; }
+  .grid .card { margin-bottom: 0; }
+  .latest-row { padding: 10px 0; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
+  .latest-row:last-child { border-bottom: none; }
+  .latest-meta { color: #666; font-size: 12px; margin-top: 2px; }
   table { width: 100%; border-collapse: collapse; background: white; border-radius: 12px; overflow: hidden; }
   th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #eee; font-size: 13px; }
   th { background: #fafafa; }
@@ -225,6 +294,11 @@ DASHBOARD_TEMPLATE = """<!doctype html>
 <body>
   <h1>🚒 Nabory PSP – woj. śląskie</h1>
   <div class="updated">Ostatnia aktualizacja: __UPDATED__ (dane odświeżane automatycznie co 12h przez GitHub Actions)</div>
+
+  <div class="card">
+    <h2>Najnowsze ogłoszenia</h2>
+    <div id="latestList"></div>
+  </div>
 
   <div class="grid">
     <div class="card"><h2>Liczba naborów wg miasta</h2><canvas id="chartCity"></canvas></div>
@@ -247,6 +321,24 @@ DASHBOARD_TEMPLATE = """<!doctype html>
 <script>
 const DATA = __DATA__;
 
+function parseDate(str) {
+  if (!str) return null;
+  let m = str.match(/(\d{1,2})[.\s](\d{1,2})[.\s](\d{4})/);
+  if (m) return new Date(+m[3], +m[2]-1, +m[1]);
+  const months = {'stycznia':0,'lutego':1,'marca':2,'kwietnia':3,'maja':4,'czerwca':5,'lipca':6,'sierpnia':7,'września':8,'października':9,'listopada':10,'grudnia':11};
+  m = str.match(/(\d{1,2})\s+([a-złąęśćźżó]+)\s+(\d{4})/i);
+  if (m && months[m[2].toLowerCase()] !== undefined) return new Date(+m[3], months[m[2].toLowerCase()], +m[1]);
+  return null;
+}
+
+const SORTED = [...DATA].sort((a, b) => {
+  const da = parseDate(a.data_ogloszenia), db = parseDate(b.data_ogloszenia);
+  if (da && db) return db - da;
+  if (da) return -1;
+  if (db) return 1;
+  return 0;
+});
+
 function bar(id, labels, values, color) {
   new Chart(document.getElementById(id), {
     type: 'bar',
@@ -267,6 +359,18 @@ bar('chartZd', __ZD_LABELS__, __ZD_VALUES__, '#2980b9');
 line('chartMonth', __MONTH_LABELS__, __MONTH_VALUES__, '#27ae60');
 bar('chartBr', __BR_LABELS__, __BR_VALUES__, '#8e44ad');
 
+function renderLatest(rows) {
+  document.getElementById('latestList').innerHTML = rows.slice(0, 5).map(r => `
+    <div class="latest-row">
+      <div>
+        <strong>${r.miasto || '?'}</strong> — ${r.stanowisko_docelowe || 'brak danych o stanowisku'}
+        <div class="latest-meta">${r.data_ogloszenia || 'brak daty'}</div>
+      </div>
+      <a href="${r.link}" target="_blank" rel="noopener">otwórz</a>
+    </div>
+  `).join('');
+}
+
 function renderTable(rows) {
   const tbody = document.getElementById('tbody');
   tbody.innerHTML = rows.map(r => `
@@ -281,11 +385,13 @@ function renderTable(rows) {
     </tr>
   `).join('');
 }
-renderTable(DATA);
+
+renderLatest(SORTED);
+renderTable(SORTED);
 
 document.getElementById('search').addEventListener('input', (e) => {
   const q = e.target.value.toLowerCase();
-  renderTable(DATA.filter(r => JSON.stringify(r).toLowerCase().includes(q)));
+  renderTable(SORTED.filter(r => JSON.stringify(r).toLowerCase().includes(q)));
 });
 </script>
 </body>
@@ -294,23 +400,47 @@ document.getElementById('search').addEventListener('input', (e) => {
 
 
 def main():
-    html = fetch_page()
-    content_tags = extract_content_tags(html)
-    links = find_nabor_links(content_tags)
+    html_text = fetch_page()
+    content, plain = extract_content(html_text)
+    parsed = parse_all(content, plain)  # link -> {miasto,data_ogloszenia,stanowisko_docelowe,liczba_stanowisk}
 
     existing = load_existing()
     existing_links = {r["link"] for r in existing}
 
-    new_rows = [parse_entry(href, tag) for href, tag in links if href not in existing_links]
+    # 1) douzupelnij braki w istniejacych wierszach (nigdy nie nadpisuj niepustych pol)
+    filled = 0
+    for r in existing:
+        info = parsed.get(r.get("link", "").rstrip("/"))
+        if not info:
+            continue
+        for field in ("miasto", "data_ogloszenia", "stanowisko_docelowe", "liczba_stanowisk"):
+            if not (r.get(field) or "").strip() and info.get(field):
+                r[field] = info[field]
+                filled += 1
 
-    if new_rows:
-        all_rows = existing + new_rows
+    # 2) dopisz nowe nabory
+    new_rows = []
+    for href, info in parsed.items():
+        if href not in existing_links:
+            new_rows.append({
+                "miasto": info["miasto"],
+                "data_ogloszenia": info["data_ogloszenia"],
+                "liczba_stanowisk": info["liczba_stanowisk"],
+                "stanowisko_docelowe": info["stanowisko_docelowe"],
+                "wymagania": "", "link": href,
+                "i_etap_chetni": "", "ii_etap_zdalo": "", "zdawalnosc_pct": "",
+                "iv_etap": "", "v_etap": "", "wynagrodzenie_brutto": "",
+                "wynagrodzenie_netto": "", "uwagi": "", "udzial": "",
+            })
+
+    all_rows = existing + new_rows
+    if new_rows or filled:
         save_all(all_rows)
+        print(f"Dodano {len(new_rows)} nowych naborów, douzupełniono {filled} pól.")
+    if new_rows:
         send_telegram(new_rows)
-        print(f"Dodano {len(new_rows)} nowych naborów.")
-    else:
-        all_rows = existing
-        print("Brak nowych naborów.")
+    if not new_rows and not filled:
+        print("Brak zmian.")
 
     build_dashboard(all_rows)
 
