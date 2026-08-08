@@ -74,14 +74,20 @@ def fetch_page():
     return resp.text
 
 
+def to_plain(text):
+    """Usuwa tagi HTML (zamieniajac na spacje) i dekoduje encje. Uzywana WSZEDZIE
+    tam gdzie liczymy pozycje w plain-texcie, zeby dlugosci sie zgadzaly -
+    zadnej dodatkowej normalizacji bialych znakow, bo to psuloby spojnosc pozycji."""
+    return html_lib.unescape(re.sub(r"<[^>]+>", " ", text))
+
+
 def extract_content(html_text):
     """Zwraca (raw_content_html, plain_text) - sekcja miedzy naglowkiem a stopka historii."""
     start = html_text.find("Nabory do KP/M PSP woj")
     section = html_text[start if start > -1 else 0:]
     end = section.find("Informacje o publikacji dokumentu")
     content = section[:end] if end > -1 else section
-    plain = html_lib.unescape(re.sub(r"<[^>]+>", " ", content))
-    plain = re.sub(r"\s+", " ", plain)
+    plain = to_plain(content)
     return content, plain
 
 
@@ -97,8 +103,7 @@ def find_links(content):
 
 def plain_pos_for(content, raw_idx):
     """Przyblizona pozycja w plain-texcie odpowiadajaca pozycji raw_idx w content (z tagami)."""
-    prefix = content[:raw_idx]
-    return len(html_lib.unescape(re.sub(r"<[^>]+>", " ", prefix)))
+    return len(to_plain(content[:raw_idx]))
 
 
 def nearest_before(matches, pos):
