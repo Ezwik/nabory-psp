@@ -136,31 +136,39 @@ def extract_count(snippet):
 
 
 def parse_all(content, plain):
-    """Zwraca dict: link -> {miasto, data_ogloszenia, stanowisko_docelowe, liczba_stanowisk}"""
+    """Zwraca dict: link -> {miasto, data_ogloszenia, termin_skladania, stanowisko_docelowe, liczba_stanowisk}
+
+    Zasada: naglowek daty ("Ogloszenie zamieszczone...") dotyczy WSZYSTKICH
+    ogloszen az do nastepnego naglowka, wiec szukamy go globalnie (ostatni
+    przed linkiem). Natomiast miasto/stanowisko/termin naleza do POJEDYNCZEGO
+    akapitu, wiec szukamy ich TYLKO w tekscie miedzy poprzednim linkiem a
+    biezacym - to gwarantuje, ze nie zlapiemy danych z innego ogloszenia.
+    """
     date_matches = list(DATE_RE.finditer(plain))
     city_matches = list(CITY_RE.finditer(plain))
     pos_matches = list(POSITION_RE.finditer(plain))
     deadline_matches = list(DEADLINE_RE.finditer(plain))
 
+    def last_in_window(matches, start, end):
+        best = None
+        for m in matches:
+            if m.start() > end:
+                break
+            if m.start() >= start:
+                best = m
+        return best
+
     result = {}
+    prev_p = 0
     for href, raw_idx in find_links(content):
         p = plain_pos_for(content, raw_idx)
 
-        dm = nearest_before(date_matches, p)
-        cm = nearest_before(city_matches, p)
-        # stanowisko zwykle jest PRZED linkiem w tym samym akapicie
-        pm = nearest_before(pos_matches, p)
-        # jesli najblizszy wczesniejszy jest za daleko (>1200 znakow), to raczej nalezy do innego akapitu
-        if pm and (p - pm.start()) > 1200:
-            pm = None
+        dm = nearest_before(date_matches, p)  # naglowek - szukany globalnie, wspolny dla grupy ogloszen
+        cm = last_in_window(city_matches, prev_p, p)
+        pm = last_in_window(pos_matches, prev_p, p)
+        dlm = last_in_window(deadline_matches, prev_p, p)
 
-        # termin skladania - rowniez w tym samym akapicie, zwykle tuz przed linkiem
-        dlm = nearest_before(deadline_matches, p)
-        if dlm and (p - dlm.start()) > 1200:
-            dlm = None
-
-        # kontekst do wyszukania liczby stanowisk (500 znakow wstecz)
-        snippet = plain[max(0, p - 800):p]
+        snippet = plain[prev_p:p]
 
         result[href] = {
             "miasto": cm.group(1).strip() if cm else "",
@@ -169,6 +177,7 @@ def parse_all(content, plain):
             "stanowisko_docelowe": clean_position(pm.group(1)) if pm else "",
             "liczba_stanowisk": extract_count(snippet),
         }
+        prev_p = p
     return result
 
 
@@ -491,16 +500,29 @@ def self_test():
         'w Jednostce ... - termin skladania dokumentow aplikacyjnych upływa 14.08.2026 r. '
         'Szczegolowe informacje: '
         '<a href="https://www.gov.pl/web/kmpsp-bytom/nabor-test">link</a></p>'
+        '<p><strong>Ogloszenie zamieszczone 01.06.2026 roku:</strong></p>'
+        '<p><strong>Komenda Powiatowa PSP w Pszczynie</strong> oglasza postepowanie kwalifikacyjne '
+        '... na stanowisko stazysta (glowny ksiegowy) w KP PSP - termin skladania dokumentow '
+        'aplikacyjnych upływa w dniu 16.06.2026 r. Szczegolowe informacje: '
+        '<a href="https://www.gov.pl/web/kppsp-pszczyna/nabor-test">link</a></p>'
         'Informacje o publikacji dokumentu'
     )
     content, plain = extract_content(sample_content)
     parsed = parse_all(content, plain)
-    info = parsed.get("https://www.gov.pl/web/kmpsp-bytom/nabor-test")
-    assert info is not None, "self-test: nie znaleziono testowego linku"
-    assert info["miasto"] == "Bytomiu", f"self-test: zle miasto: {info['miasto']!r}"
-    assert info["data_ogloszenia"] == "31.07.2026", f"self-test: zla data: {info['data_ogloszenia']!r}"
-    assert info["termin_skladania"] == "14.08.2026", f"self-test: zly termin: {info['termin_skladania']!r}"
-    assert info["stanowisko_docelowe"] == "starszy ratownik-kierowca", f"self-test: zle stanowisko: {info['stanowisko_docelowe']!r}"
+
+    bytom = parsed.get("https://www.gov.pl/web/kmpsp-bytom/nabor-test")
+    assert bytom is not None, "self-test: nie znaleziono linku Bytom"
+    assert bytom["miasto"] == "Bytomiu", f"self-test: zle miasto Bytom: {bytom['miasto']!r}"
+    assert bytom["data_ogloszenia"] == "31.07.2026", f"self-test: zla data Bytom: {bytom['data_ogloszenia']!r}"
+    assert bytom["termin_skladania"] == "14.08.2026", f"self-test: zly termin Bytom (nie moze byc z innego ogloszenia!): {bytom['termin_skladania']!r}"
+    assert bytom["stanowisko_docelowe"] == "starszy ratownik-kierowca", f"self-test: zle stanowisko Bytom: {bytom['stanowisko_docelowe']!r}"
+
+    pszczyna = parsed.get("https://www.gov.pl/web/kppsp-pszczyna/nabor-test")
+    assert pszczyna is not None, "self-test: nie znaleziono linku Pszczyna"
+    assert pszczyna["miasto"] == "Pszczynie", f"self-test: zle miasto Pszczyna: {pszczyna['miasto']!r}"
+    assert pszczyna["data_ogloszenia"] == "01.06.2026", f"self-test: zla data Pszczyna: {pszczyna['data_ogloszenia']!r}"
+    assert pszczyna["termin_skladania"] == "16.06.2026", f"self-test: zly termin Pszczyna: {pszczyna['termin_skladania']!r}"
+
     print("Self-test parsera: OK")
 
 
