@@ -16,6 +16,7 @@ import csv
 import html as html_lib
 import os
 import re
+import sys
 import json
 from datetime import datetime
 
@@ -27,20 +28,26 @@ DATA_CSV = "data.csv"
 DASHBOARD_HTML = "dashboard.html"
 
 FIELDNAMES = [
-    "miasto", "data_ogloszenia", "liczba_stanowisk", "stanowisko_docelowe",
-    "wymagania", "link", "i_etap_chetni", "ii_etap_zdalo", "zdawalnosc_pct",
-    "iv_etap", "v_etap", "wynagrodzenie_brutto", "wynagrodzenie_netto",
-    "uwagi", "udzial",
+    "miasto", "data_ogloszenia", "termin_skladania", "liczba_stanowisk",
+    "stanowisko_docelowe", "wymagania", "link", "i_etap_chetni",
+    "ii_etap_zdalo", "zdawalnosc_pct", "iv_etap", "v_etap",
+    "wynagrodzenie_brutto", "wynagrodzenie_netto", "uwagi", "udzial",
 ]
 
 # Nagłówek "Ogłoszenie(a) zamieszczone DD.MM.RRRR roku:" - zawsze format cyfrowy
 DATE_RE = re.compile(r"zamieszczon\w*\s+(\d{1,2}[.\s]\d{1,2}[.\s]\d{4})", re.I)
 
+# Termin skladania dokumentow: "uplywa 14.08.2026 r." / "uplywa w dniu 16.06.2026" / "uplywa dnia 22.04.2026"
+DEADLINE_RE = re.compile(
+    r"upływa\w*\s*[-–]?\s*(?:w dniu\s+)?(?:dnia\s+)?"
+    r"(\d{1,2}[.\s]\d{1,2}[.\s]\d{4}|\d{1,2}\s+\w+\s+\d{4})",
+    re.I,
+)
+
 # Miasto: albo skrót "PSP w X", albo pełna forma "Straży Pożarnej w X"
 CITY_RE = re.compile(
     r"(?:PSP|Straży\s+Pożarnej)\s+w\s+"
-    r"([A-ZŚŻŹĆŁÓĄĘŃ][\wąćęłńóśźż\-]+(?:\s+[A-ZŚŻŹĆŁÓĄĘŃ][\wąćęłńóśźż\-]+){0,2})",
-    re.I,
+    r"([A-ZŚŻŹĆŁÓĄĘŃ][\wąćęłńóśźż\-]+(?:\s+[A-ZŚŻŹĆŁÓĄĘŃ][\wąćęłńóśźż\-]+){0,2})"
 )
 
 # Stanowisko: to co jest w nawiasie po słowie "stażyst(a/y)"
@@ -133,6 +140,7 @@ def parse_all(content, plain):
     date_matches = list(DATE_RE.finditer(plain))
     city_matches = list(CITY_RE.finditer(plain))
     pos_matches = list(POSITION_RE.finditer(plain))
+    deadline_matches = list(DEADLINE_RE.finditer(plain))
 
     result = {}
     for href, raw_idx in find_links(content):
@@ -146,12 +154,18 @@ def parse_all(content, plain):
         if pm and (p - pm.start()) > 1200:
             pm = None
 
+        # termin skladania - rowniez w tym samym akapicie, zwykle tuz przed linkiem
+        dlm = nearest_before(deadline_matches, p)
+        if dlm and (p - dlm.start()) > 1200:
+            dlm = None
+
         # kontekst do wyszukania liczby stanowisk (500 znakow wstecz)
         snippet = plain[max(0, p - 800):p]
 
         result[href] = {
             "miasto": cm.group(1).strip() if cm else "",
             "data_ogloszenia": dm.group(1).strip() if dm else "",
+            "termin_skladania": dlm.group(1).strip() if dlm else "",
             "stanowisko_docelowe": clean_position(pm.group(1)) if pm else "",
             "liczba_stanowisk": extract_count(snippet),
         }
@@ -282,11 +296,18 @@ DASHBOARD_TEMPLATE = r"""<!doctype html>
   .latest-row { padding: 10px 0; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
   .latest-row:last-child { border-bottom: none; }
   .latest-meta { color: #666; font-size: 12px; margin-top: 2px; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; margin-left: 6px; }
+  .badge-open { background: #e6f4ea; color: #1e7e34; }
+  .badge-closed { background: #fbe9e7; color: #b71c1c; }
+  .controls { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  input#search, select#cityFilter { padding: 8px 12px; border: 1px solid #ddd; border-radius: 8px; }
+  input#search { flex: 1; min-width: 200px; }
   table { width: 100%; border-collapse: collapse; background: white; border-radius: 12px; overflow: hidden; }
   th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #eee; font-size: 13px; }
-  th { background: #fafafa; }
+  th { background: #fafafa; cursor: pointer; user-select: none; white-space: nowrap; }
+  th:hover { background: #f0f0f0; }
+  th .arrow { font-size: 10px; color: #999; margin-left: 3px; }
   tr:hover { background: #fafafa; }
-  input#search { padding: 8px 12px; width: 100%; max-width: 400px; margin-bottom: 12px; border: 1px solid #ddd; border-radius: 8px; }
   a { color: #c0392b; }
   @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
 </style>
@@ -307,12 +328,21 @@ DASHBOARD_TEMPLATE = r"""<!doctype html>
     <div class="card"><h2>Średnie wynagrodzenie brutto wg miasta</h2><canvas id="chartBr"></canvas></div>
   </div>
 
-  <input id="search" placeholder="Szukaj (miasto, stanowisko...)">
+  <div class="controls">
+    <input id="search" placeholder="Szukaj (miasto, stanowisko...)">
+    <select id="cityFilter"><option value="">Wszystkie miasta</option></select>
+  </div>
   <table id="dataTable">
     <thead>
       <tr>
-        <th>Miasto</th><th>Data</th><th>Stanowisk</th><th>Stanowisko docelowe</th>
-        <th>Zdawalność II</th><th>Wynagrodzenie brutto</th><th>Link</th>
+        <th data-key="miasto">Miasto<span class="arrow"></span></th>
+        <th data-key="__date__">Data<span class="arrow"></span></th>
+        <th data-key="__deadline__">Termin<span class="arrow"></span></th>
+        <th data-key="liczba_stanowisk">Stanowisk<span class="arrow"></span></th>
+        <th data-key="stanowisko_docelowe">Stanowisko docelowe<span class="arrow"></span></th>
+        <th data-key="zdawalnosc_pct">Zdawalność II<span class="arrow"></span></th>
+        <th data-key="wynagrodzenie_brutto">Wynagrodzenie brutto<span class="arrow"></span></th>
+        <th>Link</th>
       </tr>
     </thead>
     <tbody id="tbody"></tbody>
@@ -331,7 +361,17 @@ function parseDate(str) {
   return null;
 }
 
-const SORTED = [...DATA].sort((a, b) => {
+const TODAY = new Date(); TODAY.setHours(0,0,0,0);
+
+function statusBadge(r) {
+  const d = parseDate(r.termin_skladania);
+  if (!d) return '';
+  return d >= TODAY
+    ? '<span class="badge badge-open">otwarty</span>'
+    : '<span class="badge badge-closed">termin minął</span>';
+}
+
+let SORTED = [...DATA].sort((a, b) => {
   const da = parseDate(a.data_ogloszenia), db = parseDate(b.data_ogloszenia);
   if (da && db) return db - da;
   if (da) return -1;
@@ -364,7 +404,8 @@ function renderLatest(rows) {
     <div class="latest-row">
       <div>
         <strong>${r.miasto || '?'}</strong> — ${r.stanowisko_docelowe || 'brak danych o stanowisku'}
-        <div class="latest-meta">${r.data_ogloszenia || 'brak daty'}</div>
+        ${statusBadge(r)}
+        <div class="latest-meta">Ogłoszono: ${r.data_ogloszenia || 'brak daty'}${r.termin_skladania ? ' · Termin: ' + r.termin_skladania : ''}</div>
       </div>
       <a href="${r.link}" target="_blank" rel="noopener">otwórz</a>
     </div>
@@ -377,6 +418,7 @@ function renderTable(rows) {
     <tr>
       <td>${r.miasto || ''}</td>
       <td>${r.data_ogloszenia || ''}</td>
+      <td>${r.termin_skladania || ''} ${statusBadge(r)}</td>
       <td>${r.liczba_stanowisk || ''}</td>
       <td>${r.stanowisko_docelowe || ''}</td>
       <td>${r.zdawalnosc_pct || ''}</td>
@@ -386,23 +428,93 @@ function renderTable(rows) {
   `).join('');
 }
 
+// filtr miast
+const cities = [...new Set(DATA.map(r => r.miasto).filter(Boolean))].sort();
+const citySelect = document.getElementById('cityFilter');
+cities.forEach(c => {
+  const opt = document.createElement('option');
+  opt.value = c; opt.textContent = c;
+  citySelect.appendChild(opt);
+});
+
+let currentSortKey = null;
+let currentSortDir = 1;
+
+function applyFilters() {
+  const q = document.getElementById('search').value.toLowerCase();
+  const city = citySelect.value;
+  let rows = SORTED.filter(r => (!city || r.miasto === city) && (!q || JSON.stringify(r).toLowerCase().includes(q)));
+  if (currentSortKey) {
+    rows = [...rows].sort((a, b) => {
+      let va, vb;
+      if (currentSortKey === '__date__') { va = parseDate(a.data_ogloszenia); vb = parseDate(b.data_ogloszenia); }
+      else if (currentSortKey === '__deadline__') { va = parseDate(a.termin_skladania); vb = parseDate(b.termin_skladania); }
+      else { va = a[currentSortKey] || ''; vb = b[currentSortKey] || ''; }
+      if (va === null || va === undefined || va === '') return 1;
+      if (vb === null || vb === undefined || vb === '') return -1;
+      if (va > vb) return currentSortDir;
+      if (va < vb) return -currentSortDir;
+      return 0;
+    });
+  }
+  renderTable(rows);
+}
+
+document.querySelectorAll('th[data-key]').forEach(th => {
+  th.addEventListener('click', () => {
+    const key = th.dataset.key;
+    if (currentSortKey === key) { currentSortDir *= -1; } else { currentSortKey = key; currentSortDir = 1; }
+    document.querySelectorAll('th .arrow').forEach(a => a.textContent = '');
+    th.querySelector('.arrow').textContent = currentSortDir === 1 ? '▲' : '▼';
+    applyFilters();
+  });
+});
+
+document.getElementById('search').addEventListener('input', applyFilters);
+citySelect.addEventListener('change', applyFilters);
+
 renderLatest(SORTED);
 renderTable(SORTED);
-
-document.getElementById('search').addEventListener('input', (e) => {
-  const q = e.target.value.toLowerCase();
-  renderTable(SORTED.filter(r => JSON.stringify(r).toLowerCase().includes(q)));
-});
 </script>
 </body>
 </html>
 """
 
 
+def self_test():
+    """Szybki test heurystyk na znanym fragmencie strony - lapie regresje parsowania."""
+    sample_content = (
+        '<h2>Nabory do KP/M PSP woj.slaskiego</h2>'
+        '<p><strong>Ogloszenie zamieszczone 31.07.2026 roku:</strong></p>'
+        '<p><strong>Komenda Miejska PSP w Bytomiu</strong> oglasza z dniem 31.07.2026 r. '
+        'postepowanie kwalifikacyjne ... na stanowisko stazysty (docelowo - starszy ratownik-kierowca) '
+        'w Jednostce ... - termin skladania dokumentow aplikacyjnych upływa 14.08.2026 r. '
+        'Szczegolowe informacje: '
+        '<a href="https://www.gov.pl/web/kmpsp-bytom/nabor-test">link</a></p>'
+        'Informacje o publikacji dokumentu'
+    )
+    content, plain = extract_content(sample_content)
+    parsed = parse_all(content, plain)
+    info = parsed.get("https://www.gov.pl/web/kmpsp-bytom/nabor-test")
+    assert info is not None, "self-test: nie znaleziono testowego linku"
+    assert info["miasto"] == "Bytomiu", f"self-test: zle miasto: {info['miasto']!r}"
+    assert info["data_ogloszenia"] == "31.07.2026", f"self-test: zla data: {info['data_ogloszenia']!r}"
+    assert info["termin_skladania"] == "14.08.2026", f"self-test: zly termin: {info['termin_skladania']!r}"
+    assert info["stanowisko_docelowe"] == "starszy ratownik-kierowca", f"self-test: zle stanowisko: {info['stanowisko_docelowe']!r}"
+    print("Self-test parsera: OK")
+
+
 def main():
+    self_test()
+
     html_text = fetch_page()
     content, plain = extract_content(html_text)
-    parsed = parse_all(content, plain)  # link -> {miasto,data_ogloszenia,stanowisko_docelowe,liczba_stanowisk}
+    parsed = parse_all(content, plain)  # link -> {miasto,data_ogloszenia,termin_skladania,stanowisko_docelowe,liczba_stanowisk}
+
+    if len(parsed) == 0:
+        print("BLAD: nie znaleziono ani jednego naboru na stronie - prawdopodobnie zmienila sie jej struktura.")
+        print("Dane NIE zostaly zmodyfikowane. Sprawdz recznie strone i w razie potrzeby popraw regexy w scraper.py.")
+        sys.exit(1)
 
     existing = load_existing()
     existing_links = {r["link"] for r in existing}
@@ -413,7 +525,7 @@ def main():
         info = parsed.get(r.get("link", "").rstrip("/"))
         if not info:
             continue
-        for field in ("miasto", "data_ogloszenia", "stanowisko_docelowe", "liczba_stanowisk"):
+        for field in ("miasto", "data_ogloszenia", "termin_skladania", "stanowisko_docelowe", "liczba_stanowisk"):
             if not (r.get(field) or "").strip() and info.get(field):
                 r[field] = info[field]
                 filled += 1
@@ -425,6 +537,7 @@ def main():
             new_rows.append({
                 "miasto": info["miasto"],
                 "data_ogloszenia": info["data_ogloszenia"],
+                "termin_skladania": info["termin_skladania"],
                 "liczba_stanowisk": info["liczba_stanowisk"],
                 "stanowisko_docelowe": info["stanowisko_docelowe"],
                 "wymagania": "", "link": href,
